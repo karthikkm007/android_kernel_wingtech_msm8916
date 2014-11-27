@@ -1,4 +1,4 @@
-/* Copyright (c) 2014-2016, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2014, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -19,7 +19,6 @@
 #include <linux/msm_ion.h>
 #include <linux/mm.h>
 #include <linux/msm_audio_ion.h>
-#include <linux/vmalloc.h>
 #include <sound/core.h>
 #include <sound/soc.h>
 #include <sound/pcm.h>
@@ -72,8 +71,6 @@
 	pr_debug("DTS_EAGLE_ENABLE: " fmt "\n", ##__VA_ARGS__)
 #define eagle_enable_err(fmt, ...) \
 	pr_err("DTS_EAGLE_ENABLE: " fmt "\n", ##__VA_ARGS__)
-#define eagle_ioctl_info(fmt, ...) \
-	pr_err("DTS_EAGLE_IOCTL: " fmt "\n", ##__VA_ARGS__)
 
 enum {
 	AUDIO_DEVICE_OUT_EARPIECE = 0,
@@ -181,7 +178,7 @@ static inline void *_getd(struct dts_eagle_param_desc *depd)
 static int _ref_cnt;
 /* dts eagle parameter cache */
 static char *_depc;
-static u32 _depc_size;
+static s32 _depc_size;
 static s32 _c_bl[CB_COUNT][CBD_COUNT];
 static u32 _device_primary;
 static u32 _device_all;
@@ -197,14 +194,13 @@ static struct param_outband _po_NT;
 #define SEC_BLOB_MAX_CNT 10
 #define SEC_BLOB_MAX_SIZE 0x4004 /*extra 4 for size*/
 static char *_sec_blob[SEC_BLOB_MAX_CNT];
-struct mutex _sec_lock;
 
 /* multi-copp support */
 static int _cidx[AFE_MAX_PORTS] = {-1};
 
 /* volume controls */
 #define VOL_CMD_CNT_MAX 10
-static u32 _vol_cmd_cnt;
+static s32 _vol_cmd_cnt;
 static s32 **_vol_cmds;
 struct vol_cmds_d {
 	s32 d[4];
@@ -363,14 +359,14 @@ static int _is_port_open_and_eagle(int pid)
 static int _isNTDevice(u32 device)
 {
 	if (device &
-		((1 << AUDIO_DEVICE_OUT_BLUETOOTH_SCO) |
-		(1 << AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET) |
-		(1 << AUDIO_DEVICE_OUT_BLUETOOTH_SCO_CARKIT) |
-		(1 << AUDIO_DEVICE_OUT_BLUETOOTH_A2DP) |
-		(1 << AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES) |
-		(1 << AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER) |
-		(1 << AUDIO_DEVICE_OUT_AUX_DIGITAL)))
+	    ((1 << AUDIO_DEVICE_OUT_BLUETOOTH_SCO) |
+	     (1 << AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET) |
+	     (1 << AUDIO_DEVICE_OUT_BLUETOOTH_SCO_CARKIT) |
+	     (1 << AUDIO_DEVICE_OUT_BLUETOOTH_A2DP) |
+	     (1 << AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES) |
+	     (1 << AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER))) {
 		return 1;
+	}
 	return 0;
 }
 
@@ -380,8 +376,7 @@ static void _reg_ion_mem(void)
 	rc = msm_audio_ion_alloc("DTS_EAGLE", &_ion_client, &_ion_handle,
 			    ION_MEM_SIZE, &_po.paddr, &_po.size, &_po.kvaddr);
 	if (rc)
-		eagle_drv_err("%s: msm audio ion alloc failed with %i",
-				__func__, rc);
+		eagle_drv_err("%s: msm audio ion alloc failed",	__func__);
 }
 
 static void _unreg_ion_mem(void)
@@ -389,8 +384,7 @@ static void _unreg_ion_mem(void)
 	int rc;
 	rc = msm_audio_ion_free(_ion_client, _ion_handle);
 	if (rc)
-		eagle_drv_err("%s: msm audio ion alloc failed with %i",
-				__func__, rc);
+		eagle_drv_err("%s: msm audio ion free failed", __func__);
 }
 
 static void _reg_ion_mem_NT(void)
@@ -409,23 +403,18 @@ static void _reg_ion_mem_NT(void)
 	if (rc < 0) {
 		eagle_drv_err("%s: memory map failed", __func__);
 		msm_audio_ion_free(_ion_client_NT, _ion_handle_NT);
-		_ion_client_NT = NULL;
-		_ion_handle_NT = NULL;
 	}
 }
 
 static void _unreg_ion_mem_NT(void)
 {
 	int rc;
-	rc = q6asm_memory_unmap(_ac_NT,	_po_NT.paddr, IN);
+	rc = q6asm_memory_unmap(_ac_NT,	(uint32_t) _po_NT.paddr, IN);
 	if (rc < 0)
 		eagle_drv_err("%s: mem unmap failed", __func__);
 	rc = msm_audio_ion_free(_ion_client_NT, _ion_handle_NT);
 	if (rc < 0)
 		eagle_drv_err("%s: mem free failed", __func__);
-
-	_ion_client_NT = NULL;
-	_ion_handle_NT = NULL;
 }
 
 static struct audio_client *_getNTDeviceAC(void)
@@ -448,8 +437,7 @@ static void _clear_audioclient(void)
 
 static int _sendcache_pre(struct audio_client *ac)
 {
-	uint32_t offset, size;
-	int32_t cidx, cmd, err = 0;
+	int offset, cidx, size, cmd;
 	cidx = _get_cb_for_dev(_device_primary);
 	if (cidx < 0) {
 		eagle_precache_err("%s: no cache for primary device %i found",
@@ -459,43 +447,37 @@ static int _sendcache_pre(struct audio_client *ac)
 	offset = _c_bl[cidx][CBD_OFFSG];
 	cmd = _c_bl[cidx][CBD_CMD0];
 	size = _c_bl[cidx][CBD_SZ0];
-	/* check for integer overflow */
-	if (offset > (UINT_MAX - size))
-		err = -EINVAL;
-	if ((_depc_size == 0) || !_depc || (size == 0) ||
-		cmd == 0 || ((offset + size) > _depc_size) || (err != 0)) {
-		eagle_precache_err("%s: primary device %i cache index %i general error - cache size = %u, cache ptr = %pK, offset = %u, size = %u, cmd = %i",
+
+	if (_depc_size == 0 || !_depc || offset < 0 || size <= 0 || cmd == 0 ||
+	    (offset + size) > _depc_size) {
+		eagle_precache_err("%s: primary device %i cache index %i general error - cache size = %u, cache ptr = %p, offset = %i, size = %i, cmd = %i",
 			__func__, _device_primary, cidx, _depc_size, _depc,
 			offset, size, cmd);
 		return -EINVAL;
 	}
 
-	if ((offset < (UINT_MAX - 124)) && ((offset + 124) < _depc_size))
-		eagle_precache_dbg("%s: first 6 integers %i %i %i %i %i %i (30th %i)",
-			__func__, *((int *)&_depc[offset]),
-			*((int *)&_depc[offset+4]),
-			*((int *)&_depc[offset+8]),
-			*((int *)&_depc[offset+12]),
-			*((int *)&_depc[offset+16]),
-			*((int *)&_depc[offset+20]),
-			*((int *)&_depc[offset+120]));
-	eagle_precache_dbg("%s: sending full data block to port, with cache index = %d device mask 0x%X, param = 0x%X, offset = %u, and size = %u",
+	eagle_precache_dbg("%s: first 6 integers %i %i %i %i %i %i (30th %i)",
+		  __func__,
+		  *((int *)&_depc[offset]), *((int *)&_depc[offset+4]),
+		  *((int *)&_depc[offset+8]), *((int *)&_depc[offset+12]),
+		  *((int *)&_depc[offset+16]), *((int *)&_depc[offset+20]),
+		  *((int *)&_depc[offset+120]));
+	eagle_precache_dbg("%s: sending full data block to port, with cache index = %d device mask 0x%X, param = 0x%X, offset = %d, and size = %d",
 		  __func__, cidx, _c_bl[cidx][CBD_DEV_MASK], cmd, offset, size);
 
 	if (q6asm_dts_eagle_set(ac, cmd, size, (void *)&_depc[offset],
 				NULL, MPRE))
-		eagle_precache_err("%s: q6asm_dts_eagle_set failed with id = %d and size = %u",
+		eagle_precache_err("%s: q6asm_dts_eagle_set failed with id = %d and size = %d",
 			__func__, cmd, size);
 	else
-		eagle_precache_dbg("%s: q6asm_dts_eagle_set succeeded with id = %d and size = %u",
+		eagle_precache_dbg("%s: q6asm_dts_eagle_set succeeded with id = %d and size = %d",
 			 __func__, cmd, size);
 	return 0;
 }
 
 static int _sendcache_post(int port_id, int copp_idx, int topology)
 {
-	int cidx = -1, cmd, mask, index, err = 0;
-	uint32_t offset, size;
+	int offset, cidx = -1, size, cmd, mask, index;
 
 	if (port_id == -1) {
 		cidx = _get_cb_for_dev(_device_primary);
@@ -508,13 +490,12 @@ static int _sendcache_post(int port_id, int copp_idx, int topology)
 	}
 
 	index = adm_validate_and_get_port_index(port_id);
-	if (index < 0) {
+	if (index < 0)
 		eagle_postcache_err("%s: Invalid port idx %d port_id %#x",
 			__func__, index, port_id);
-		return -EINVAL;
-	}
-	eagle_postcache_dbg("%s: valid port idx %d for port_id %#x set to %i",
-		__func__, index, port_id, copp_idx);
+	else
+		eagle_postcache_dbg("%s: valid port idx %d for port_id %#x set to %i",
+			 __func__, index, port_id, copp_idx);
 	_cidx[index] = copp_idx;
 
 	mask = _get_dev_mask_for_pid(port_id);
@@ -543,26 +524,19 @@ NT_MODE_GOTO:
 	cmd = _c_bl[cidx][CBD_CMD2];
 	size = _c_bl[cidx][CBD_SZ2];
 
-	/* check for integer overflow */
-	if (offset > (UINT_MAX - size))
-		err = -EINVAL;
-	if ((_depc_size == 0) || !_depc || (err != 0) || (size == 0) ||
-		(cmd == 0) || (offset + size) > _depc_size) {
-		eagle_postcache_err("%s: primary device %i cache index %i port_id 0x%X general error - cache size = %u, cache ptr = %pK, offset = %u, size = %u, cmd = %i",
+	if (_depc_size == 0 || !_depc || offset < 0 || size <= 0 || cmd == 0 ||
+	    (offset + size) > _depc_size) {
+		eagle_postcache_err("%s: primary device %i cache index %i port_id 0x%X general error - cache size = %u, cache ptr = %p, offset = %i, size = %i, cmd = %i",
 			__func__, _device_primary, cidx, port_id,
 			_depc_size, _depc, offset, size, cmd);
 		return -EINVAL;
 	}
 
-	if ((offset < (UINT_MAX - 24)) && ((offset + 24) < _depc_size))
-		eagle_postcache_dbg("%s: first 6 integers %i %i %i %i %i %i",
-			__func__, *((int *)&_depc[offset]),
-			*((int *)&_depc[offset+4]),
-			*((int *)&_depc[offset+8]),
-			*((int *)&_depc[offset+12]),
-			*((int *)&_depc[offset+16]),
-			*((int *)&_depc[offset+20]));
-	eagle_postcache_dbg("%s: sending full data block to port, with cache index = %d device mask 0x%X, port_id = 0x%X, param = 0x%X, offset = %u, and size = %u",
+	eagle_postcache_dbg("%s: first 6 integers %i %i %i %i %i %i", __func__,
+		  *((int *)&_depc[offset]), *((int *)&_depc[offset+4]),
+		  *((int *)&_depc[offset+8]), *((int *)&_depc[offset+12]),
+		  *((int *)&_depc[offset+16]), *((int *)&_depc[offset+20]));
+	eagle_postcache_dbg("%s: sending full data block to port, with cache index = %d device mask 0x%X, port_id = 0x%X, param = 0x%X, offset = %d, and size = %d",
 		__func__, cidx, _c_bl[cidx][CBD_DEV_MASK], port_id, cmd,
 		offset, size);
 
@@ -571,14 +545,14 @@ NT_MODE_GOTO:
 		if (q6asm_dts_eagle_set(_getNTDeviceAC(), cmd, size,
 					(void *)&_depc[offset],
 					&_po_NT, MPST))
-			eagle_postcache_err("%s: q6asm_dts_eagle_set failed with id = 0x%X and size = %u",
+			eagle_postcache_err("%s: q6asm_dts_eagle_set failed with id = 0x%X and size = %d",
 				__func__, cmd, size);
 	} else if (adm_dts_eagle_set(port_id, copp_idx, cmd,
 			      (void *)&_depc[offset], size) < 0)
-		eagle_postcache_err("%s: adm_dts_eagle_set failed with id = 0x%X and size = %u",
+		eagle_postcache_err("%s: adm_dts_eagle_set failed with id = 0x%X and size = %d",
 			__func__, cmd, size);
 	else
-		eagle_postcache_dbg("%s: adm_dts_eagle_set succeeded with id = 0x%X and size = %u",
+		eagle_postcache_dbg("%s: adm_dts_eagle_set succeeded with id = 0x%X and size = %d",
 			 __func__, cmd, size);
 	return 0;
 }
@@ -609,7 +583,7 @@ static int _enable_post_put_control(struct snd_kcontrol *kcontrol,
 		      msm_bedai.active))
 			continue;
 		for (idx = 0; idx < MAX_COPPS_PER_PORT; idx++) {
-			topology = adm_get_topology_for_port_copp_idx(
+			topology = adm_get_topology_for_port_from_copp_id(
 								port_id, idx);
 			if (topology ==
 				ADM_CMD_COPP_OPEN_TOPOLOGY_ID_DTS_HPX) {
@@ -718,14 +692,14 @@ void msm_dts_eagle_add_controls(struct snd_soc_platform *platform)
  */
 int msm_dts_eagle_set_stream_gain(struct audio_client *ac, int lgain, int rgain)
 {
-	u32 i, val;
-	s32 idx, err = 0;
+	s32 i, val;
+	s32 idx;
 
-	eagle_vol_dbg("%s: - entry: vol_cmd_cnt = %u, lgain = %i, rgain = %i",
+	eagle_vol_dbg("%s: - entry: vol_cmd_cnt = %i, lgain = %i, rgain = %i",
 		 __func__, _vol_cmd_cnt, lgain, rgain);
 
 	if (_depc_size == 0) {
-		eagle_vol_dbg("%s: driver cache not initialized", __func__);
+		eagle_vol_err("%s: driver cache not initialized", __func__);
 		return -EINVAL;
 	}
 
@@ -739,7 +713,7 @@ int msm_dts_eagle_set_stream_gain(struct audio_client *ac, int lgain, int rgain)
 						    _vol_cmds_d[i].d[1]) >> 16),
 						    _vol_cmds_d[i].d[2],
 						    _vol_cmds_d[i].d[3]);
-			 eagle_vol_dbg("%s: loop %u cmd desc found %i, idx = %i. volume info: lgain = %i, rgain = %i, volume = %i (scale %i, min %i, max %i)",
+			 eagle_vol_dbg("%s: loop %i cmd desc found %i, idx = %i. volume info: lgain = %i, rgain = %i, volume = %i (scale %i, min %i, max %i)",
 				 __func__, i, _vol_cmds_d[i].d[0], idx, lgain,
 				 rgain, _vol_cmds[i][idx], _vol_cmds_d[i].d[1],
 				 _vol_cmds_d[i].d[2], _vol_cmds_d[i].d[3]);
@@ -751,24 +725,21 @@ int msm_dts_eagle_set_stream_gain(struct audio_client *ac, int lgain, int rgain)
 			return -EINVAL;
 		}
 		val = _c_bl[idx][CBD_OFFSG] + _vol_cmds[i][2];
-		/* check for integer overflow */
-		if (val > (UINT_MAX - _vol_cmds[i][1]))
-			err = -EINVAL;
-		if ((err != 0) || ((val + _vol_cmds[i][1]) > _depc_size)) {
-			eagle_vol_err("%s: volume size (%u) + offset (%i) out of bounds %i",
+		if ((val + _vol_cmds[i][1]) > _depc_size) {
+			eagle_vol_err("%s: volume size (%i) + offset (%i) out of bounds %i",
 				__func__, val, _vol_cmds[i][1], _depc_size);
 			return -EINVAL;
 		}
 		memcpy((void *)&_depc[val], &_vol_cmds[i][4], _vol_cmds[i][1]);
 		if (q6asm_dts_eagle_set(ac, _vol_cmds[i][0],
 			_vol_cmds[i][1], (void *)&_depc[val], NULL, MPRE))
-			eagle_vol_err("%s: loop %u - volume set failed with id 0x%X, size %i, offset %i, cmd_desc %i, scale %i, min %i, max %i, data(...) %i",
+			eagle_vol_err("%s: loop %i - volume set failed with id 0x%X, size %i, offset %i, cmd_desc %i, scale %i, min %i, max %i, data(...) %i",
 				__func__, i, _vol_cmds[i][0], _vol_cmds[i][1],
 				_vol_cmds[i][2], _vol_cmds_d[i].d[0],
 				_vol_cmds_d[i].d[1], _vol_cmds_d[i].d[2],
 				_vol_cmds_d[i].d[3], _vol_cmds[i][4]);
 		else
-			eagle_vol_dbg("%s: loop %u - volume set succeeded with id 0x%X, size %i, offset %i, cmd_desc %i, scale %i, min %i, max %i, data(...) %i",
+			eagle_vol_dbg("%s: loop %i - volume set succeeded with id 0x%X, size %i, offset %i, cmd_desc %i, scale %i, min %i, max %i, data(...) %i",
 				 __func__, i, _vol_cmds[i][0], _vol_cmds[i][1],
 				 _vol_cmds[i][2], _vol_cmds_d[i].d[0],
 				 _vol_cmds_d[i].d[1], _vol_cmds_d[i].d[2],
@@ -795,8 +766,7 @@ int msm_dts_eagle_handle_asm(struct dts_eagle_param_desc *depd, char *buf,
 			     struct param_outband *po)
 {
 	struct dts_eagle_param_desc depd_ = {0};
-	s32 ret = 0, isALSA = 0, err = 0, i, mod = for_pre ? MPRE : MPST;
-	u32 offset;
+	s32 offset, ret = 0, isALSA = 0, i, mod = for_pre ? MPRE : MPST;
 
 	eagle_asm_dbg("%s: set/get asm", __func__);
 
@@ -805,7 +775,7 @@ int msm_dts_eagle_handle_asm(struct dts_eagle_param_desc *depd, char *buf,
 		long *arg_ = (long *)buf;
 		depd = &depd_;
 		depd->id = (u32)*arg_++;
-		depd->size = (u32)*arg_++;
+		depd->size = (s32)*arg_++;
 		depd->offset = (s32)*arg_++;
 		depd->device = (u32)*arg_++;
 		buf = (char *)arg_;
@@ -813,7 +783,7 @@ int msm_dts_eagle_handle_asm(struct dts_eagle_param_desc *depd, char *buf,
 	}
 
 	if (depd->size & 1) {
-		eagle_asm_err("%s: parameter size %u is not a multiple of 2",
+		eagle_asm_err("%s: parameter size %i is not a multiple of 2",
 			__func__, depd->size);
 		return -EINVAL;
 	}
@@ -823,13 +793,7 @@ int msm_dts_eagle_handle_asm(struct dts_eagle_param_desc *depd, char *buf,
 		eagle_asm_dbg("%s: get requested", __func__);
 		if (depd->offset == -1) {
 			eagle_asm_dbg("%s: get from dsp requested", __func__);
-			if (depd->size > 0 && depd->size <= DEPC_MAX_SIZE) {
-				buf_ = buf_m = vzalloc(depd->size);
-			} else {
-				eagle_asm_err("%s: get size %u invalid",
-					      __func__, depd->size);
-				return -EINVAL;
-			}
+			buf_ = buf_m = kzalloc(depd->size, GFP_KERNEL);
 			if (!buf_m) {
 				eagle_asm_err("%s: out of memory", __func__);
 				return -ENOMEM;
@@ -840,89 +804,71 @@ int msm_dts_eagle_handle_asm(struct dts_eagle_param_desc *depd, char *buf,
 				ret = -EFAULT;
 				goto DTS_EAGLE_IOCTL_GET_PARAM_PRE_EXIT;
 			}
-			eagle_asm_dbg("%s: get result: param id 0x%x value %d size %u",
+			eagle_asm_dbg("%s: get result: param id 0x%x value %d size %d",
 				 __func__, depd->id, *(int *)buf_m, depd->size);
 		} else {
 			s32 tgt = _get_cb_for_dev(depd->device);
 			if (tgt < 0) {
-				eagle_asm_err("%s: no cache for device %u found",
+				eagle_asm_err("%s: no cache for device %i found",
 					__func__, depd->device);
 				return -EINVAL;
 			}
 			offset = _c_bl[tgt][CBD_OFFSG] + depd->offset;
-			/* check for integer overflow */
-			if (offset > (UINT_MAX - depd->size))
-				err = -EINVAL;
-			if ((err != 0) || (offset + depd->size) > _depc_size) {
-				eagle_asm_err("%s: invalid size %u and/or offset %u",
+			if ((offset + depd->size) > _depc_size) {
+				eagle_asm_err("%s: invalid size %d and/or offset %d",
 					__func__, depd->size, offset);
 				return -EINVAL;
 			}
 			buf_ = (u32 *)&_depc[offset];
 		}
 		if (isALSA) {
-			if (depd->size == 2) {
-				*(long *)buf = (long)*(__u16 *)buf_;
-				eagle_asm_dbg("%s: asm out 16 bit value %li",
-						__func__, *(long *)buf);
-			} else {
-				s32 *pbuf = (s32 *)buf_;
-				long *bufl = (long *)buf;
-				for (i = 0; i < (depd->size >> 2); i++) {
-					*bufl++ = (long)*pbuf++;
-					eagle_asm_dbg("%s: asm out value %li",
-							 __func__, *(bufl-1));
-				}
+			if (depd->size == 2)
+				*(long *)buf++ = (long)*(__u16 *)buf_;
+			else {
+				u32 *pbuf = (u32 *)buf_;
+				for (i = 0; i < (depd->size >> 2); i++)
+					*(long *)buf++ = (long)*pbuf++;
 			}
 		} else {
 			memcpy(buf, buf_, depd->size);
 		}
 DTS_EAGLE_IOCTL_GET_PARAM_PRE_EXIT:
-		vfree(buf_m);
+		kfree(buf_m);
 		return (int)ret;
 	} else {
 		s32 tgt = _get_cb_for_dev(depd->device);
 		if (tgt < 0) {
-			eagle_asm_err("%s: no cache for device %u found",
+			eagle_asm_err("%s: no cache for device %i found",
 				__func__, depd->device);
 			return -EINVAL;
 		}
 		offset = _c_bl[tgt][CBD_OFFSG] + depd->offset;
-		/* check for integer overflow */
-		if (offset > (UINT_MAX - depd->size))
-			err = -EINVAL;
-		if ((err != 0) || ((offset + depd->size) > _depc_size)) {
-			eagle_asm_err("%s: invalid size %u and/or offset %u for parameter (cache is size %u)",
+		if ((offset + depd->size) > _depc_size) {
+			eagle_asm_err("%s: invalid size %i and/or offset %i for parameter (cache is size %u)",
 				__func__, depd->size, offset, _depc_size);
 			return -EINVAL;
 		}
 		if (isALSA) {
 			if (depd->size == 2) {
 				*(__u16 *)&_depc[offset] = (__u16)*(long *)buf;
-				eagle_asm_dbg("%s: asm in 16 bit value %li",
-						__func__, *(long *)buf);
 			} else {
-				s32 *pbuf = (s32 *)&_depc[offset];
-				long *bufl = (long *)buf;
-				for (i = 0; i < (depd->size >> 2); i++) {
-					*pbuf++ = (s32)*bufl++;
-					eagle_asm_dbg("%s: asm in value %i",
-							__func__, *(pbuf-1));
-				}
+				u32 *pbuf = (u32 *)&_depc[offset];
+				for (i = 0; i < (depd->size >> 2); i++)
+					*pbuf++ = (u32)*(long *)buf++;
 			}
 		} else {
 			memcpy(&_depc[offset], buf, depd->size);
 		}
-		eagle_asm_dbg("%s: param info: param = 0x%X, size = %u, offset = %i, device = %u, cache block %i, global offset = %u, first bytes as integer = %i",
+		eagle_asm_dbg("%s: param info: param = 0x%X, size = %i, offset = %i, device = %i, cache block %i, global offset = %i, first bytes as integer = %i",
 			__func__, depd->id, depd->size, depd->offset,
 			depd->device,
 			tgt, offset, *(int *)&_depc[offset]);
 		if (q6asm_dts_eagle_set(ac, depd->id, depd->size,
 					(void *)&_depc[offset], po, mod))
-			eagle_asm_err("%s: q6asm_dts_eagle_set failed with id = 0x%X, size = %u, offset = %d",
+			eagle_asm_err("%s: q6asm_dts_eagle_set failed with id = 0x%X, size = %d, offset = %d",
 				__func__, depd->id, depd->size, depd->offset);
 		else
-			eagle_asm_dbg("%s: q6asm_dts_eagle_set succeeded with id = 0x%X, size = %u, offset = %d",
+			eagle_asm_dbg("%s: q6asm_dts_eagle_set succeeded with id = 0x%X, size = %d, offset = %d",
 				 __func__, depd->id, depd->size, depd->offset);
 	}
 	return (int)ret;
@@ -952,7 +898,7 @@ int msm_dts_eagle_handle_adm(struct dts_eagle_param_desc *depd, char *buf,
 		ret = msm_dts_eagle_handle_asm(depd, buf, for_pre, get,
 					       _getNTDeviceAC(), &_po_NT);
 		if (ret < 0)
-			eagle_adm_err("%s: NT Route set failed with id = 0x%X, size = %u, offset = %i, device = %u",
+			eagle_adm_err("%s: NT Route set failed with id = 0x%X, size = %i, offset = %i, device = %i",
 				__func__, depd->id, depd->size, depd->offset,
 				depd->device);
 	} else if (get) {
@@ -967,7 +913,7 @@ int msm_dts_eagle_handle_adm(struct dts_eagle_param_desc *depd, char *buf,
 		}
 	} else if (_is_port_open_and_eagle(pid)) {
 		cidx = adm_validate_and_get_port_index(pid);
-		eagle_adm_dbg("%s: adm_dts_eagle_set called with id = 0x%X, size = %u, offset = %i, device = %u, port id = %u, copp index = %u",
+		eagle_adm_dbg("%s: adm_dts_eagle_set called with id = 0x%X, size = %i, offset = %i, device = %i, port id = %u, copp index = %u",
 				__func__, depd->id, depd->size, depd->offset,
 				depd->device, pid, cidx);
 		ret = adm_dts_eagle_set(pid, _cidx[cidx], depd->id,
@@ -999,7 +945,7 @@ int msm_dts_eagle_ioctl(unsigned int cmd, unsigned long arg)
 	s32 ret = 0;
 	switch (cmd) {
 	case DTS_EAGLE_IOCTL_GET_CACHE_SIZE: {
-		eagle_ioctl_info("%s: called with control 0x%X (get param cache size)",
+		eagle_ioctl_dbg("%s: called with control 0x%X (get param cache size)",
 			__func__, cmd);
 		if (copy_to_user((void *)arg, &_depc_size,
 				 sizeof(_depc_size))) {
@@ -1009,15 +955,15 @@ int msm_dts_eagle_ioctl(unsigned int cmd, unsigned long arg)
 		break;
 	}
 	case DTS_EAGLE_IOCTL_SET_CACHE_SIZE: {
-		u32 size = 0;
-		eagle_ioctl_info("%s: called with control 0x%X (allocate param cache)",
+		s32 size = 0;
+		eagle_ioctl_dbg("%s: called with control 0x%X (allocate param cache)",
 			__func__, cmd);
 		if (copy_from_user((void *)&size, (void *)arg, sizeof(size))) {
-			eagle_ioctl_err("%s: error copying size (src:%pK, tgt:%pK, size:%zu)",
+			eagle_ioctl_err("%s: error copying size (src:%p, tgt:%p, size:%zu)",
 				__func__, (void *)arg, &size, sizeof(size));
 			return -EFAULT;
-		} else if (size > DEPC_MAX_SIZE) {
-			eagle_ioctl_err("%s: cache size %u not allowed (min 0, max %u)",
+		} else if (size < 0 || size > DEPC_MAX_SIZE) {
+			eagle_ioctl_err("%s: cache size %d not allowed (min 0, max %d)",
 				__func__, size, DEPC_MAX_SIZE);
 			return -EINVAL;
 		}
@@ -1025,20 +971,20 @@ int msm_dts_eagle_ioctl(unsigned int cmd, unsigned long arg)
 			eagle_ioctl_dbg("%s: previous param cache of size %u freed",
 				__func__, _depc_size);
 			_depc_size = 0;
-			vfree(_depc);
+			kfree(_depc);
 			_depc = NULL;
 		}
 		if (size)
-			_depc = vzalloc(size);
+			_depc = kzalloc(size, GFP_KERNEL);
 		else
-			eagle_ioctl_dbg("%s: %u bytes requested for param cache, nothing allocated",
+			eagle_ioctl_dbg("%s: %d bytes requested for param cache, nothing allocated",
 				__func__, size);
 		if (_depc) {
-			eagle_ioctl_dbg("%s: %u bytes allocated for param cache",
+			eagle_ioctl_dbg("%s: %d bytes allocated for param cache",
 				__func__, size);
 			_depc_size = size;
 		} else {
-			eagle_ioctl_err("%s: error allocating param cache (vzalloc failed on %u bytes)",
+			eagle_ioctl_err("%s: error allocating param cache (kzalloc failed on %d bytes)",
 				__func__, size);
 			_depc_size = 0;
 			return -ENOMEM;
@@ -1047,13 +993,12 @@ int msm_dts_eagle_ioctl(unsigned int cmd, unsigned long arg)
 	}
 	case DTS_EAGLE_IOCTL_GET_PARAM: {
 		struct dts_eagle_param_desc depd;
-		s32 for_pre = 0, get_from_core = 0, err = 0;
-		u32 offset;
+		s32 offset = 0, for_pre = 0, get_from_core = 0;
 		void *buf, *buf_m = NULL;
-		eagle_ioctl_info("%s: control 0x%X (get param)",
+		eagle_ioctl_dbg("%s: control 0x%X (get param)",
 			__func__, cmd);
 		if (copy_from_user((void *)&depd, (void *)arg, sizeof(depd))) {
-			eagle_ioctl_err("%s: error copying dts_eagle_param_desc (src:%pK, tgt:%pK, size:%zu)",
+			eagle_ioctl_err("%s: error copying dts_eagle_param_desc (src:%p, tgt:%p, size:%zu)",
 				__func__, (void *)arg, &depd, sizeof(depd));
 			return -EFAULT;
 		}
@@ -1069,13 +1014,7 @@ int msm_dts_eagle_ioctl(unsigned int cmd, unsigned long arg)
 		}
 		depd.device &= DTS_EAGLE_FLAG_IOCTL_MASK;
 		if (depd.offset == -1) {
-			if (depd.size > 0 && depd.size <= DEPC_MAX_SIZE) {
-				buf = buf_m = vzalloc(depd.size);
-			} else {
-				eagle_ioctl_err("%s: get size %u invalid",
-						__func__, depd.size);
-				return -EINVAL;
-			}
+			buf = buf_m = kzalloc(depd.size, GFP_KERNEL);
 			if (!buf_m) {
 				eagle_ioctl_err("%s: out of memory", __func__);
 				return -ENOMEM;
@@ -1089,17 +1028,13 @@ int msm_dts_eagle_ioctl(unsigned int cmd, unsigned long arg)
 		} else {
 			s32 cb = _get_cb_for_dev(depd.device);
 			if (cb < 0) {
-				eagle_ioctl_err("%s: no cache for device %u found",
+				eagle_ioctl_err("%s: no cache for device %i found",
 					__func__, depd.device);
 				return -EINVAL;
 			}
 			offset = _c_bl[cb][CBD_OFFSG] + depd.offset;
-			/* check for integer overflow */
-			if (offset > (UINT_MAX - depd.size))
-				err = -EINVAL;
-			if ((err != 0) ||
-			    ((offset + depd.size) > _depc_size)) {
-				eagle_ioctl_err("%s: invalid size %u and/or offset %u",
+			if ((offset + depd.size) > _depc_size) {
+				eagle_ioctl_err("%s: invalid size %d and/or offset %d",
 					__func__, depd.size, offset);
 				return -EINVAL;
 			}
@@ -1113,18 +1048,17 @@ int msm_dts_eagle_ioctl(unsigned int cmd, unsigned long arg)
 			eagle_ioctl_err("%s: error copying get data", __func__);
 			ret = -EFAULT;
 		}
-		vfree(buf_m);
+		kfree(buf_m);
 		break;
 	}
 	case DTS_EAGLE_IOCTL_SET_PARAM: {
 		struct dts_eagle_param_desc depd;
-		s32 just_set_cache = 0, for_pre = 0, err = 0;
-		u32 offset;
+		s32 offset = 0, just_set_cache = 0, for_pre = 0;
 		s32 tgt;
-		eagle_ioctl_info("%s: control 0x%X (set param)",
+		eagle_ioctl_dbg("%s: control 0x%X (set param)",
 			__func__, cmd);
 		if (copy_from_user((void *)&depd, (void *)arg, sizeof(depd))) {
-			eagle_ioctl_err("%s: error copying dts_eagle_param_desc (src:%pK, tgt:%pK, size:%zu)",
+			eagle_ioctl_err("%s: error copying dts_eagle_param_desc (src:%p, tgt:%p, size:%zu)",
 				__func__, (void *)arg, &depd, sizeof(depd));
 			return -EFAULT;
 		}
@@ -1140,16 +1074,13 @@ int msm_dts_eagle_ioctl(unsigned int cmd, unsigned long arg)
 		depd.device &= DTS_EAGLE_FLAG_IOCTL_MASK;
 		tgt = _get_cb_for_dev(depd.device);
 		if (tgt < 0) {
-			eagle_ioctl_err("%s: no cache for device %u found",
+			eagle_ioctl_err("%s: no cache for device %i found",
 				__func__, depd.device);
 			return -EINVAL;
 		}
 		offset = _c_bl[tgt][CBD_OFFSG] + depd.offset;
-		/* check for integer overflow */
-		if (offset > (UINT_MAX - depd.size))
-			err = -EINVAL;
-		if ((err != 0) || ((offset + depd.size) > _depc_size)) {
-			eagle_ioctl_err("%s: invalid size %u and/or offset %u for parameter (target cache block %i with offset %i, global cache is size %u)",
+		if ((offset + depd.size) > _depc_size) {
+			eagle_ioctl_err("%s: invalid size %i and/or offset %i for parameter (target cache block %i with offset %i, global cache is size %u)",
 				__func__, depd.size, offset, tgt,
 				_c_bl[tgt][CBD_OFFSG], _depc_size);
 			return -EINVAL;
@@ -1157,12 +1088,12 @@ int msm_dts_eagle_ioctl(unsigned int cmd, unsigned long arg)
 		if (copy_from_user((void *)&_depc[offset],
 				   (void *)(((char *)arg)+sizeof(depd)),
 					depd.size)) {
-			eagle_ioctl_err("%s: error copying param to cache (src:%pK, tgt:%pK, size:%u)",
+			eagle_ioctl_err("%s: error copying param to cache (src:%p, tgt:%p, size:%i)",
 				__func__, ((char *)arg)+sizeof(depd),
 				&_depc[offset], depd.size);
 			return -EFAULT;
 		}
-		eagle_ioctl_dbg("%s: param info: param = 0x%X, size = %u, offset = %i, device = %u, cache block %i, global offset = %u, first bytes as integer = %i",
+		eagle_ioctl_dbg("%s: param info: param = 0x%X, size = %i, offset = %i, device = %i, cache block %i, global offset = %i, first bytes as integer = %i",
 			__func__, depd.id, depd.size, depd.offset,
 			depd.device, tgt, offset, *(int *)&_depc[offset]);
 		if (!just_set_cache) {
@@ -1173,10 +1104,10 @@ int msm_dts_eagle_ioctl(unsigned int cmd, unsigned long arg)
 	}
 	case DTS_EAGLE_IOCTL_SET_CACHE_BLOCK: {
 		u32 b_[CBD_COUNT+1], *b = &b_[1], cb;
-		eagle_ioctl_info("%s: with control 0x%X (set param cache block)",
+		eagle_ioctl_dbg("%s: with control 0x%X (set param cache block)",
 			 __func__, cmd);
 		if (copy_from_user((void *)b_, (void *)arg, sizeof(b_))) {
-			eagle_ioctl_err("%s: error copying cache block data (src:%pK, tgt:%pK, size:%zu)",
+			eagle_ioctl_err("%s: error copying cache block data (src:%p, tgt:%p, size:%zu)",
 				__func__, (void *)arg, b_, sizeof(b_));
 			return -EFAULT;
 		}
@@ -1186,7 +1117,7 @@ int msm_dts_eagle_ioctl(unsigned int cmd, unsigned long arg)
 				__func__, cb, CB_COUNT-1);
 			return -EINVAL;
 		}
-		eagle_ioctl_dbg("%s: cache block %i set: devices 0x%X, global offset %i, offsets 1:%u 2:%u 3:%u, cmds/sizes 0:0x%X %u 1:0x%X %u 2:0x%X %u 3:0x%X %u",
+		eagle_ioctl_dbg("%s: cache block %i set: devices 0x%X, global offset %u, offsets 1:%u 2:%u 3:%u, cmds/sizes 0:0x%X %u 1:0x%X %u 2:0x%X %u 3:0x%X %u",
 		__func__, cb, _c_bl[cb][CBD_DEV_MASK], _c_bl[cb][CBD_OFFSG],
 		_c_bl[cb][CBD_OFFS1], _c_bl[cb][CBD_OFFS2],
 		_c_bl[cb][CBD_OFFS3], _c_bl[cb][CBD_CMD0], _c_bl[cb][CBD_SZ0],
@@ -1207,7 +1138,7 @@ int msm_dts_eagle_ioctl(unsigned int cmd, unsigned long arg)
 		eagle_ioctl_dbg("%s: with control 0x%X (set active device)",
 			 __func__, cmd);
 		if (copy_from_user((void *)data, (void *)arg, sizeof(data))) {
-			eagle_ioctl_err("%s: error copying active device data (src:%pK, tgt:%pK, size:%zu)",
+			eagle_ioctl_err("%s: error copying active device data (src:%p, tgt:%p, size:%zu)",
 				__func__, (void *)arg, data, sizeof(data));
 			return -EFAULT;
 		}
@@ -1223,35 +1154,32 @@ int msm_dts_eagle_ioctl(unsigned int cmd, unsigned long arg)
 		break;
 	}
 	case DTS_EAGLE_IOCTL_GET_LICENSE: {
-		u32 target = 0, size = 0;
-		s32 size_only;
+		u32 target = 0;
+		s32 size = 0, size_only;
 		eagle_ioctl_dbg("%s: with control 0x%X (get license)",
 			 __func__, cmd);
 		if (copy_from_user((void *)&target, (void *)arg,
 				   sizeof(target))) {
-			eagle_ioctl_err("%s: error reading license index. (src:%pK, tgt:%pK, size:%zu)",
+			eagle_ioctl_err("%s: error reading license index. (src:%p, tgt:%p, size:%zu)",
 				__func__, (void *)arg, &target, sizeof(target));
 			return -EFAULT;
 		}
 		size_only = target & (1<<31) ? 1 : 0;
 		target &= 0x7FFFFFFF;
-		if (target >= SEC_BLOB_MAX_CNT) {
-			eagle_ioctl_err("%s: license index %u out of bounds (max index is %i)",
+		if (target < 0 || target >= SEC_BLOB_MAX_CNT) {
+			eagle_ioctl_err("%s: license index %i out of bounds (max index is %i)",
 				   __func__, target, SEC_BLOB_MAX_CNT);
 			return -EINVAL;
 		}
-		mutex_lock(&_sec_lock);
 		if (_sec_blob[target] == NULL) {
-			eagle_ioctl_err("%s: license index %u never initialized",
+			eagle_ioctl_err("%s: license index %i never initialized",
 				   __func__, target);
-			mutex_unlock(&_sec_lock);
 			return -EINVAL;
 		}
-		size = ((u32 *)_sec_blob[target])[0];
-		if ((size == 0) || (size > SEC_BLOB_MAX_SIZE)) {
-			eagle_ioctl_err("%s: license size %u for index %u invalid (min size is 1, max size is %u)",
+		size = ((s32 *)_sec_blob[target])[0];
+		if (size <= 0 || size > SEC_BLOB_MAX_SIZE) {
+			eagle_ioctl_err("%s: license size %i for index %i invalid (min size is 1, max size is %i)",
 				   __func__, size, target, SEC_BLOB_MAX_SIZE);
-			mutex_unlock(&_sec_lock);
 			return -EINVAL;
 		}
 		if (size_only) {
@@ -1261,125 +1189,115 @@ int msm_dts_eagle_ioctl(unsigned int cmd, unsigned long arg)
 				 (void *)&size, sizeof(size))) {
 				eagle_ioctl_err("%s: error copying license size",
 						__func__);
-				mutex_unlock(&_sec_lock);
 				return -EFAULT;
 			}
 		} else if (copy_to_user((void *)(((char *)arg)+sizeof(target)),
 			   (void *)&(((s32 *)_sec_blob[target])[1]), size)) {
 			eagle_ioctl_err("%s: error copying license data",
 				__func__);
-			mutex_unlock(&_sec_lock);
 			return -EFAULT;
 		} else
-			eagle_ioctl_info("%s: license file %u bytes long from license index %u returned to user",
+			eagle_ioctl_dbg("%s: license file %i bytes long from license index %i returned to user",
 				  __func__, size, target);
-		mutex_unlock(&_sec_lock);
 		break;
 	}
 	case DTS_EAGLE_IOCTL_SET_LICENSE: {
-		u32 target[2] = {0, 0};
+		s32 target[2] = {0, 0};
 		eagle_ioctl_dbg("%s: control 0x%X (set license)", __func__,
 				cmd);
 		if (copy_from_user((void *)target, (void *)arg,
 				   sizeof(target))) {
-			eagle_ioctl_err("%s: error reading license index (src:%pK, tgt:%pK, size:%zu)",
+			eagle_ioctl_err("%s: error reading license index (src:%p, tgt:%p, size:%zu)",
 				__func__, (void *)arg, target, sizeof(target));
 			return -EFAULT;
 		}
-		if (target[0] >= SEC_BLOB_MAX_CNT) {
-			eagle_ioctl_err("%s: license index %u out of bounds (max index is %u)",
+		if (target[0] < 0 || target[0] >= SEC_BLOB_MAX_CNT) {
+			eagle_ioctl_err("%s: license index %i out of bounds (max index is %i)",
 				   __func__, target[0], SEC_BLOB_MAX_CNT-1);
 			return -EINVAL;
 		}
-		mutex_lock(&_sec_lock);
 		if (target[1] == 0) {
-			eagle_ioctl_dbg("%s: request to free license index %u",
+			eagle_ioctl_dbg("%s: request to free license index %i",
 				 __func__, target[0]);
 			kfree(_sec_blob[target[0]]);
 			_sec_blob[target[0]] = NULL;
-			mutex_unlock(&_sec_lock);
 			break;
 		}
-		if ((target[1] == 0) || (target[1] >= SEC_BLOB_MAX_SIZE)) {
-			eagle_ioctl_err("%s: license size %u for index %u invalid (min size is 1, max size is %u)",
+		if (target[1] <= 0 || target[1] >= SEC_BLOB_MAX_SIZE) {
+			eagle_ioctl_err("%s: license size %i for index %i invalid (min size is 1, max size is %i)",
 				__func__, target[1], target[0],
 				SEC_BLOB_MAX_SIZE);
-			mutex_unlock(&_sec_lock);
 			return -EINVAL;
 		}
 		if (_sec_blob[target[0]] != NULL) {
-			eagle_ioctl_dbg("%s: reallocate already allocated license index %i",
-				 __func__, target[0]);
-			kfree(_sec_blob[target[0]]);
-			_sec_blob[target[0]] = NULL;
+			if (((s32 *)_sec_blob[target[0]])[1] != target[1]) {
+				eagle_ioctl_dbg("%s: request new size for already allocated license index %i",
+					 __func__, target[0]);
+				kfree(_sec_blob[target[0]]);
+				_sec_blob[target[0]] = NULL;
+			}
 		}
-		eagle_ioctl_dbg("%s: allocating %u bytes for license index %u",
+		eagle_ioctl_dbg("%s: allocating %i bytes for license index %i",
 				__func__, target[1], target[0]);
 		_sec_blob[target[0]] = kzalloc(target[1] + 4, GFP_KERNEL);
 		if (!_sec_blob[target[0]]) {
-			eagle_ioctl_err("%s: error allocating license index %u (kzalloc failed on %u bytes)",
+			eagle_ioctl_err("%s: error allocating license index %i (kzalloc failed on %i bytes)",
 					__func__, target[0], target[1]);
-			mutex_unlock(&_sec_lock);
 			return -ENOMEM;
 		}
-		((u32 *)_sec_blob[target[0]])[0] = target[1];
+		((s32 *)_sec_blob[target[0]])[0] = target[1];
 		if (copy_from_user(
-				(void *)&(((u32 *)_sec_blob[target[0]])[1]),
+				(void *)&(((s32 *)_sec_blob[target[0]])[1]),
 				(void *)(((char *)arg)+sizeof(target)),
 				target[1])) {
-			eagle_ioctl_err("%s: error copying license to index %u, size %u (src:%pK, tgt:%pK, size:%u)",
+			eagle_ioctl_err("%s: error copying license to index %i, size %i (src:%p, tgt:%p, size:%i)",
 					__func__, target[0], target[1],
 					((char *)arg)+sizeof(target),
-					&(((u32 *)_sec_blob[target[0]])[1]),
+					&(((s32 *)_sec_blob[target[0]])[1]),
 					target[1]);
-			mutex_unlock(&_sec_lock);
 			return -EFAULT;
 		} else
-			eagle_ioctl_info("%s: license file %u bytes long copied to index license index %u",
+			eagle_ioctl_dbg("%s: license file %i bytes long copied to index license index %i",
 				  __func__, target[1], target[0]);
-		mutex_unlock(&_sec_lock);
 		break;
 	}
 	case DTS_EAGLE_IOCTL_SEND_LICENSE: {
-		u32 target = 0;
+		s32 target = 0;
 		eagle_ioctl_dbg("%s: control 0x%X (send license)", __func__,
 				cmd);
 		if (copy_from_user((void *)&target, (void *)arg,
 				   sizeof(target))) {
-			eagle_ioctl_err("%s: error reading license index (src:%pK, tgt:%pK, size:%zu)",
+			eagle_ioctl_err("%s: error reading license index (src:%p, tgt:%p, size:%zu)",
 				__func__, (void *)arg, &target, sizeof(target));
 			return -EFAULT;
 		}
 		if (target >= SEC_BLOB_MAX_CNT) {
-			eagle_ioctl_err("%s: license index %u out of bounds (max index is %i)",
+			eagle_ioctl_err("%s: license index %i out of bounds (max index is %i)",
 					__func__, target, SEC_BLOB_MAX_CNT-1);
 			return -EINVAL;
 		}
-		mutex_lock(&_sec_lock);
 		if (!_sec_blob[target] ||
-		    ((u32 *)_sec_blob[target])[0] == 0) {
-			eagle_ioctl_err("%s: license index %u is invalid",
+		    ((s32 *)_sec_blob[target])[0] <= 0) {
+			eagle_ioctl_err("%s: license index %i is invalid",
 				__func__, target);
-			mutex_unlock(&_sec_lock);
 			return -EINVAL;
 		}
 		if (core_dts_eagle_set(((s32 *)_sec_blob[target])[0],
 				(char *)&((s32 *)_sec_blob[target])[1]) < 0)
-			eagle_ioctl_err("%s: core_dts_eagle_set failed with id = %u",
+			eagle_ioctl_err("%s: core_dts_eagle_set failed with id = %i",
 				__func__, target);
 		else
-			eagle_ioctl_info("%s: core_dts_eagle_set succeeded with id = %u",
+			eagle_ioctl_dbg("%s: core_dts_eagle_set succeeded with id = %i",
 				 __func__, target);
-		mutex_unlock(&_sec_lock);
 		break;
 	}
 	case DTS_EAGLE_IOCTL_SET_VOLUME_COMMANDS: {
 		s32 spec = 0;
-		eagle_ioctl_info("%s: control 0x%X (set volume commands)",
+		eagle_ioctl_dbg("%s: control 0x%X (set volume commands)",
 				__func__, cmd);
 		if (copy_from_user((void *)&spec, (void *)arg,
 					sizeof(spec))) {
-			eagle_ioctl_err("%s: error reading volume command specifier (src:%pK, tgt:%pK, size:%zu)",
+			eagle_ioctl_err("%s: error reading volume command specifier (src:%p, tgt:%p, size:%zu)",
 				__func__, (void *)arg, &spec, sizeof(spec));
 			return -EFAULT;
 		}
@@ -1389,7 +1307,7 @@ int msm_dts_eagle_ioctl(unsigned int cmd, unsigned long arg)
 			eagle_ioctl_dbg("%s: setting volume command %i size: %i",
 				__func__, idx, size);
 			if (idx >= _vol_cmd_cnt) {
-				eagle_ioctl_err("%s: volume command index %u out of bounds (only %u allocated)",
+				eagle_ioctl_err("%s: volume command index %i out of bounds (only %i allocated)",
 					__func__, idx, _vol_cmd_cnt);
 				return -EINVAL;
 			}
@@ -1401,7 +1319,7 @@ int msm_dts_eagle_ioctl(unsigned int cmd, unsigned long arg)
 			if (copy_from_user((void *)&_vol_cmds_d[idx],
 					(void *)(((char *)arg) + sizeof(int)),
 					sizeof(struct vol_cmds_d))) {
-				eagle_ioctl_err("%s: error reading volume command descriptor (src:%pK, tgt:%pK, size:%zu)",
+				eagle_ioctl_err("%s: error reading volume command descriptor (src:%p, tgt:%p, size:%zu)",
 					__func__, ((char *)arg) + sizeof(int),
 					&_vol_cmds_d[idx],
 					sizeof(struct vol_cmds_d));
@@ -1414,7 +1332,7 @@ int msm_dts_eagle_ioctl(unsigned int cmd, unsigned long arg)
 			if (copy_from_user((void *)_vol_cmds[idx],
 					(void *)(((char *)arg) + (sizeof(int) +
 					sizeof(struct vol_cmds_d))), size)) {
-				eagle_ioctl_err("%s: error reading volume command string (src:%pK, tgt:%pK, size:%i)",
+				eagle_ioctl_err("%s: error reading volume command string (src:%p, tgt:%p, size:%i)",
 					__func__, ((char *)arg) + (sizeof(int) +
 					sizeof(struct vol_cmds_d)),
 					_vol_cmds[idx], size);
@@ -1461,7 +1379,6 @@ int msm_dts_eagle_ioctl(unsigned int cmd, unsigned long arg)
  *
  * Return: Return failure if any.
  */
-#ifdef CONFIG_COMPAT
 int msm_dts_eagle_compat_ioctl(unsigned int cmd, unsigned long arg)
 {
 	switch (cmd) {
@@ -1500,7 +1417,7 @@ int msm_dts_eagle_compat_ioctl(unsigned int cmd, unsigned long arg)
 	}
 	return msm_dts_eagle_ioctl(cmd, arg);
 }
-#endif
+
 /**
  * msm_dts_eagle_init_pre() - Initialize DTS premix module
  * @ac:	Initialize premix module in the ASM session.
@@ -1591,18 +1508,6 @@ int msm_dts_eagle_deinit_master_module(struct audio_client *ac)
 }
 
 /**
- * msm_dts_eagle_is_hpx_on() - Check if HPX effects are On
- *
- * Check if HPX effects are On
- *
- * Return: On/Off.
- */
-int msm_dts_eagle_is_hpx_on(void)
-{
-	return _is_hpx_enabled;
-}
-
-/**
  * msm_dts_eagle_pcm_new() - Create hwdep node
  * @runtime:	snd_soc_pcm_runtime structure.
  *
@@ -1616,7 +1521,6 @@ int msm_dts_eagle_pcm_new(struct snd_soc_pcm_runtime *runtime)
 		_init_cb_descs();
 		_reg_ion_mem();
 	}
-	mutex_init(&_sec_lock);
 	return 0;
 }
 
@@ -1632,8 +1536,6 @@ void msm_dts_eagle_pcm_free(struct snd_pcm *pcm)
 {
 	if (!--_ref_cnt)
 		_unreg_ion_mem();
-	vfree(_depc);
-	mutex_destroy(&_sec_lock);
 }
 
 MODULE_DESCRIPTION("DTS EAGLE platform driver");

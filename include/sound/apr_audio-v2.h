@@ -2524,9 +2524,8 @@ struct afe_port_cmdrsp_get_param_v2 {
 #define VPM_TX_DM_RFECNS_COPP_TOPOLOGY			0x00010F86
 #define VPM_TX_LEC_STEREO_REF				0x00010F8C
 #define VPM_TX_LEC_MONO_REF				0x00010F8D
-#define ADM_CMD_COPP_OPEN_TOPOLOGY_ID_DTS_HPX_0		0x00010347
-#define ADM_CMD_COPP_OPEN_TOPOLOGY_ID_DTS_HPX_1		0x00010348
 #define ADM_CMD_COPP_OPEN_TOPOLOGY_ID_AUDIOSPHERE	0x10015003
+#define ADM_CMD_COPP_OPEN_TOPOLOGY_ID_DTS_HPX		0x11000002
 
 /* Memory map regions command payload used by the
  * #ASM_CMD_SHARED_MEM_MAP_REGIONS ,#ADM_CMD_SHARED_MEM_MAP_REGIONS
@@ -7364,6 +7363,18 @@ struct asm_dts_eagle_param_get {
 	struct apr_hdr	hdr;
 	struct asm_stream_cmd_get_pp_params_v2 param;
 } __packed;
+
+struct param_outband {
+	size_t       size;
+	void        *kvaddr;
+	phys_addr_t  paddr;
+};
+
+/* size of header needed for passing data out of band */
+#define CMD_OB_HDR_SZ  12
+
+/* size of header needed for getting data */
+#define CMD_GET_HDR_SZ 16
 
 /* LSM Specific */
 #define VW_FEAT_DIM					(39)

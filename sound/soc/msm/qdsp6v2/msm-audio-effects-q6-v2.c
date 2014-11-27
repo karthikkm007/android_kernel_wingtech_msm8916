@@ -15,6 +15,7 @@
 #include <sound/q6asm-v2.h>
 #include <sound/compress_params.h>
 #include <sound/msm-audio-effects-q6-v2.h>
+#include <sound/devdep_params.h>
 
 #define GET_NEXT(ptr, upper_limit, rc)                                  \
 ({                                                                      \
@@ -45,6 +46,26 @@ bool msm_audio_effects_is_effmodule_supp_in_top(int effect_module,
 	case EQ_MODULE:
 		switch (topology) {
 		case ASM_STREAM_POSTPROC_TOPO_ID_SA_PLUS:
+		case ASM_STREAM_POSTPROC_TOPO_ID_HPX_PLUS:
+		case ASM_STREAM_POSTPROC_TOPO_ID_HPX_MASTER:
+			return true;
+		default:
+			return false;
+		}
+	case DTS_EAGLE_MODULE:
+		switch (topology) {
+		case ASM_STREAM_POSTPROC_TOPO_ID_DTS_HPX:
+		case ASM_STREAM_POSTPROC_TOPO_ID_HPX_PLUS:
+		case ASM_STREAM_POSTPROC_TOPO_ID_HPX_MASTER:
+			return true;
+		default:
+			return false;
+		}
+	case SOFT_VOLUME2_MODULE:
+	case DTS_EAGLE_MODULE_ENABLE:
+		switch (topology) {
+		case ASM_STREAM_POSTPROC_TOPO_ID_HPX_PLUS:
+		case ASM_STREAM_POSTPROC_TOPO_ID_HPX_MASTER:
 			return true;
 		default:
 			return false;

@@ -43,6 +43,8 @@
 #include <sound/compress_offload.h>
 #include <sound/compress_driver.h>
 #include <sound/msm-audio-effects-q6-v2.h>
+#include <sound/msm-dts-eagle.h>
+
 #include "msm-pcm-routing-v2.h"
 #include "audio_ocmem.h"
 
@@ -174,6 +176,12 @@ const u32 compr_codecs[] = {SND_AUDIOCODEC_AC3, SND_AUDIOCODEC_EAC3};
 static unsigned int supported_sample_rates[] = {
 	8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000,
 	88200, 96000, 176400, 192000
+struct query_audio_effect {
+	uint32_t mod_id;
+	uint32_t parm_id;
+	uint32_t size;
+	uint32_t offset;
+	uint32_t device;
 };
 
 struct msm_compr_audio_effects {
@@ -183,6 +191,7 @@ struct msm_compr_audio_effects {
 	struct reverb_params reverb;
 	struct eq_params equalizer;
 	struct soft_volume_params volume;
+	struct query_audio_effect query;
 };
 
 struct msm_compr_dec_params {
@@ -287,15 +296,36 @@ static int msm_compr_set_volume(struct snd_compr_stream *cstream,
 			pr_debug("%s: call q6asm_set_lrgain\n", __func__);
 			rc = q6asm_set_lrgain(prtd->audio_client,
 						volume_l, volume_r);
-			if (rc < 0)
-				pr_err("%s: Send LR gain command failed rc=%d\n",
-					__func__, rc);
-			break;
-		case Q6_SUBSYS_INVALID:
-		default:
-			pr_err("%s: UNKNOWN AVS IMAGE\n", __func__);
-			return rc;
+			if (rc < 0) {
+				pr_err("%s: set lrgain command failed rc=%d\n",
+				__func__, rc);
+				return rc;
+			}
+			/*
+			 * set master gain to unity so that only lr gain
+			 * is effective
+			 */
+			rc = q6asm_set_volume(prtd->audio_client,
+						COMPRESSED_LR_VOL_MAX_STEPS);
+		} else {
+			pr_debug("%s: call q6asm_set_volume\n", __func__);
+			/*
+			 * set left and right channel gain to unity so that
+			 * only master gain is effective
+			 */
+			rc = q6asm_set_lrgain(prtd->audio_client,
+						COMPRESSED_LR_VOL_MAX_STEPS,
+						COMPRESSED_LR_VOL_MAX_STEPS);
+			if (rc < 0) {
+				pr_err("%s: set lrgain command failed rc=%d\n",
+				__func__, rc);
+				return rc;
+			}
+			rc = q6asm_set_volume(prtd->audio_client, volume_l);
 		}
+		if (rc < 0)
+			pr_err("%s: Send Volume command failed rc=%d\n",
+				__func__, rc);
 	}
 	if (rc < 0)
 		pr_err("%s: Send vol gain command failed rc=%d\n",
@@ -985,6 +1015,26 @@ static int msm_compr_init_pp_params(struct snd_compr_stream *cstream,
 	};
 
 	switch (ac->topology) {
+	case ASM_STREAM_POSTPROC_TOPO_ID_HPX_PLUS: /* HPX + SA+ topology */
+
+		ret = q6asm_set_softvolume_v2(ac, &softvol,
+					      SOFT_VOLUME_INSTANCE_1);
+		if (ret < 0)
+			pr_err("%s: Send SoftVolume Param failed ret=%d\n",
+			__func__, ret);
+
+		ret = q6asm_set_softvolume_v2(ac, &softvol,
+					      SOFT_VOLUME_INSTANCE_2);
+		if (ret < 0)
+			pr_err("%s: Send SoftVolume2 Param failed ret=%d\n",
+			__func__, ret);
+		/*
+		 * HPX module init is trigerred from HAL using ioctl
+		 * DTS_EAGLE_MODULE_ENABLE when stream starts
+		 */
+		break;
+	case ASM_STREAM_POSTPROC_TOPO_ID_DTS_HPX: /* HPX topology */
+		break;
 	default:
 		ret = q6asm_set_softvolume_v2(ac, &softvol,
 					      SOFT_VOLUME_INSTANCE_1);
@@ -2784,6 +2834,23 @@ static int msm_compr_audio_effects_config_put(struct snd_kcontrol *kcontrol,
 						    &(audio_effects->equalizer),
 						     values);
 		break;
+	case DTS_EAGLE_MODULE:
+		pr_debug("%s: DTS_EAGLE_MODULE\n", __func__);
+		if (!msm_audio_effects_is_effmodule_supp_in_top(effects_module,
+						prtd->audio_client->topology))
+			return 0;
+		msm_dts_eagle_handle_asm(NULL, (void *)values, true,
+					 false, prtd->audio_client, NULL);
+		break;
+	case DTS_EAGLE_MODULE_ENABLE:
+		pr_debug("%s: DTS_EAGLE_MODULE_ENABLE\n", __func__);
+		if (msm_audio_effects_is_effmodule_supp_in_top(effects_module,
+						prtd->audio_client->topology))
+			msm_dts_eagle_enable_asm(prtd->audio_client,
+					(bool)values[0],
+					AUDPROC_MODULE_ID_DTS_HPX_PREMIX);
+
+		break;
 	case SOFT_VOLUME_MODULE:
 		pr_debug("%s: SOFT_VOLUME_MODULE\n", __func__);
 		break;
@@ -2805,7 +2872,130 @@ static int msm_compr_audio_effects_config_put(struct snd_kcontrol *kcontrol,
 static int msm_compr_audio_effects_config_get(struct snd_kcontrol *kcontrol,
 					   struct snd_ctl_elem_value *ucontrol)
 {
-	/* dummy function */
+	struct snd_soc_platform *platform = snd_kcontrol_chip(kcontrol);
+	unsigned long fe_id = kcontrol->private_value;
+	struct msm_compr_pdata *pdata = (struct msm_compr_pdata *)
+			snd_soc_platform_get_drvdata(platform);
+	struct msm_compr_audio_effects *audio_effects = NULL;
+	struct snd_compr_stream *cstream = NULL;
+	struct msm_compr_audio *prtd = NULL;
+	long *values = &(ucontrol->value.integer.value[0]);
+
+	pr_debug("%s\n", __func__);
+	if (fe_id >= MSM_FRONTEND_DAI_MAX) {
+		pr_err("%s Received out of bounds fe_id %lu\n",
+			__func__, fe_id);
+		return -EINVAL;
+	}
+	cstream = pdata->cstream[fe_id];
+	audio_effects = pdata->audio_effects[fe_id];
+	if (!cstream || !audio_effects) {
+		pr_err("%s: stream or effects inactive\n", __func__);
+		return -EINVAL;
+	}
+	prtd = cstream->runtime->private_data;
+	if (!prtd) {
+		pr_err("%s: cannot set audio effects\n", __func__);
+		return -EINVAL;
+	}
+
+	switch (audio_effects->query.mod_id) {
+	case DTS_EAGLE_MODULE:
+		pr_debug("%s: DTS_EAGLE_MODULE handling queued get\n",
+			 __func__);
+		values[0] = (long)audio_effects->query.mod_id;
+		values[1] = (long)audio_effects->query.parm_id;
+		values[2] = (long)audio_effects->query.size;
+		values[3] = (long)audio_effects->query.offset;
+		values[4] = (long)audio_effects->query.device;
+		msm_dts_eagle_handle_asm(NULL, (void *)&values[1],
+					 true, true, prtd->audio_client, NULL);
+		break;
+	default:
+		break;
+	}
+	return 0;
+}
+
+static int msm_compr_query_audio_effect_put(struct snd_kcontrol *kcontrol,
+					   struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_platform *platform = snd_kcontrol_chip(kcontrol);
+	unsigned long fe_id = kcontrol->private_value;
+	struct msm_compr_pdata *pdata = (struct msm_compr_pdata *)
+			snd_soc_platform_get_drvdata(platform);
+	struct msm_compr_audio_effects *audio_effects = NULL;
+	struct snd_compr_stream *cstream = NULL;
+	struct msm_compr_audio *prtd = NULL;
+	long *values = &(ucontrol->value.integer.value[0]);
+
+	pr_debug("%s\n", __func__);
+	if (fe_id >= MSM_FRONTEND_DAI_MAX) {
+		pr_err("%s Received out of bounds fe_id %lu\n",
+			__func__, fe_id);
+		return -EINVAL;
+	}
+	cstream = pdata->cstream[fe_id];
+	audio_effects = pdata->audio_effects[fe_id];
+	if (!cstream || !audio_effects) {
+		pr_err("%s: stream or effects inactive\n", __func__);
+		return -EINVAL;
+	}
+	prtd = cstream->runtime->private_data;
+	if (!prtd) {
+		pr_err("%s: cannot set audio effects\n", __func__);
+		return -EINVAL;
+	}
+	if (prtd->compr_passthr != LEGACY_PCM) {
+		pr_debug("%s: No effects for compr_type[%d]\n",
+			__func__, prtd->compr_passthr);
+		return 0;
+	} else {
+		pr_debug("%s: Effects supported for compr_type[%d]\n",
+			 __func__, prtd->compr_passthr);
+	}
+	audio_effects->query.mod_id = (u32)*values++;
+	audio_effects->query.parm_id = (u32)*values++;
+	audio_effects->query.size = (u32)*values++;
+	audio_effects->query.offset = (u32)*values++;
+	audio_effects->query.device = (u32)*values++;
+	return 0;
+}
+
+static int msm_compr_query_audio_effect_get(struct snd_kcontrol *kcontrol,
+					   struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_platform *platform = snd_kcontrol_chip(kcontrol);
+	unsigned long fe_id = kcontrol->private_value;
+	struct msm_compr_pdata *pdata = (struct msm_compr_pdata *)
+			snd_soc_platform_get_drvdata(platform);
+	struct msm_compr_audio_effects *audio_effects = NULL;
+	struct snd_compr_stream *cstream = NULL;
+	struct msm_compr_audio *prtd = NULL;
+	long *values = &(ucontrol->value.integer.value[0]);
+
+	pr_debug("%s\n", __func__);
+	if (fe_id >= MSM_FRONTEND_DAI_MAX) {
+		pr_err("%s Received out of bounds fe_id %lu\n",
+			__func__, fe_id);
+		return -EINVAL;
+	}
+	cstream = pdata->cstream[fe_id];
+	audio_effects = pdata->audio_effects[fe_id];
+	if (!cstream || !audio_effects) {
+		pr_err("%s: stream or effects inactive\n", __func__);
+		return -EINVAL;
+	}
+	prtd = cstream->runtime->private_data;
+	if (!prtd) {
+		pr_err("%s: cannot set audio effects\n", __func__);
+		return -EINVAL;
+	}
+	values[0] = (long)audio_effects->query.mod_id;
+	values[1] = (long)audio_effects->query.parm_id;
+	values[2] = (long)audio_effects->query.size;
+	values[3] = (long)audio_effects->query.offset;
+	values[4] = (long)audio_effects->query.device;
 	return 0;
 }
 
@@ -3149,6 +3339,16 @@ static int msm_compr_audio_effects_config_info(struct snd_kcontrol *kcontrol,
 	return 0;
 }
 
+static int msm_compr_query_audio_effect_info(struct snd_kcontrol *kcontrol,
+					     struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->count = 128;
+	uinfo->value.integer.min = 0;
+	uinfo->value.integer.max = 0xFFFFFFFF;
+	return 0;
+}
+
 static int msm_compr_dec_params_info(struct snd_kcontrol *kcontrol,
 				     struct snd_ctl_elem_info *uinfo)
 {
@@ -3269,6 +3469,48 @@ static int msm_compr_add_audio_effects_control(struct snd_soc_pcm_runtime *rtd)
 	snd_soc_add_platform_controls(rtd->platform,
 				fe_audio_effects_config_control,
 				ARRAY_SIZE(fe_audio_effects_config_control));
+	kfree(mixer_str);
+	return 0;
+}
+
+static int msm_compr_add_query_audio_effect_control(
+					struct snd_soc_pcm_runtime *rtd)
+{
+	const char *mixer_ctl_name = "Query Audio Effect Param";
+	const char *deviceNo       = "NN";
+	char *mixer_str = NULL;
+	int ctl_len;
+	struct snd_kcontrol_new fe_query_audio_effect_control[1] = {
+		{
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.name = "?",
+		.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+		.info = msm_compr_query_audio_effect_info,
+		.get = msm_compr_query_audio_effect_get,
+		.put = msm_compr_query_audio_effect_put,
+		.private_value = 0,
+		}
+	};
+	if (!rtd) {
+		pr_err("%s NULL rtd\n", __func__);
+		return 0;
+	}
+	pr_debug("%s: added new compr FE with name %s, id %d, cpu dai %s, device no %d\n",
+		 __func__, rtd->dai_link->name, rtd->dai_link->be_id,
+		 rtd->dai_link->cpu_dai_name, rtd->pcm->device);
+	ctl_len = strlen(mixer_ctl_name) + 1 + strlen(deviceNo) + 1;
+	mixer_str = kzalloc(ctl_len, GFP_KERNEL);
+	if (!mixer_str) {
+		pr_err("failed to allocate mixer ctrl str of len %d", ctl_len);
+		return 0;
+	}
+	snprintf(mixer_str, ctl_len, "%s %d", mixer_ctl_name, rtd->pcm->device);
+	fe_query_audio_effect_control[0].name = mixer_str;
+	fe_query_audio_effect_control[0].private_value = rtd->dai_link->be_id;
+	pr_debug("Registering new mixer ctl %s\n", mixer_str);
+	snd_soc_add_platform_controls(rtd->platform,
+				fe_query_audio_effect_control,
+				ARRAY_SIZE(fe_query_audio_effect_control));
 	kfree(mixer_str);
 	return 0;
 }
@@ -3493,10 +3735,17 @@ static int msm_compr_new(struct snd_soc_pcm_runtime *rtd)
 	rc = msm_compr_add_volume_control(rtd);
 	if (rc)
 		pr_err("%s: Could not add Compr Volume Control\n", __func__);
+
 	rc = msm_compr_add_audio_effects_control(rtd);
 	if (rc)
 		pr_err("%s: Could not add Compr Audio Effects Control\n",
 			__func__);
+
+	rc = msm_compr_add_query_audio_effect_control(rtd);
+	if (rc)
+		pr_err("%s: Could not add Compr Query Audio Effect Control\n",
+			__func__);
+
 	rc = msm_compr_add_dec_runtime_params_control(rtd);
 	if (rc)
 		pr_err("%s: Could not add Compr Dec runtime params Control\n",
