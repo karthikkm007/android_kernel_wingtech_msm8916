@@ -11415,7 +11415,7 @@ static int tasha_cpe_initialize(struct snd_soc_codec *codec)
 	cpe_params.codec = codec;
 	cpe_params.get_cpe_core = tasha_codec_get_cpe_core;
 	cpe_params.cdc_cb = &cpe_cb;
-	cpe_params.dbg_mode = tasha_cpe_debug_mode;
+	cpe_params.dbg_mode = cpe_debug_mode;
 	cpe_params.cdc_major_ver = CPE_SVC_CODEC_WCD9335;
 	cpe_params.cdc_minor_ver = CPE_SVC_CODEC_V1P0;
 	cpe_params.cdc_id = CPE_SVC_CODEC_WCD9335;
