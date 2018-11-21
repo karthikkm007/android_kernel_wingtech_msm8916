@@ -173,9 +173,10 @@ struct msm_compr_audio {
 
 const u32 compr_codecs[] = {SND_AUDIOCODEC_AC3, SND_AUDIOCODEC_EAC3};
 
-static unsigned int supported_sample_rates[] = {
-	8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000,
-	88200, 96000, 176400, 192000
+//static unsigned int supported_sample_rates[] = {
+//	8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000,
+//	88200, 96000, 176400, 192000
+//};
 struct query_audio_effect {
 	uint32_t mod_id;
 	uint32_t parm_id;
