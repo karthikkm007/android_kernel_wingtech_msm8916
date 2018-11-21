@@ -7364,12 +7364,6 @@ struct asm_dts_eagle_param_get {
 	struct asm_stream_cmd_get_pp_params_v2 param;
 } __packed;
 
-struct param_outband {
-	size_t       size;
-	void        *kvaddr;
-	phys_addr_t  paddr;
-};
-
 /* size of header needed for passing data out of band */
 #define CMD_OB_HDR_SZ  12
 
